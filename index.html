@@ -217,11 +217,14 @@
   .sched-item{border:1px solid var(--border);border-radius:10px;padding:9px;margin-bottom:9px;background:var(--surface2)}
   .sched-item .top{display:grid;grid-template-columns:1fr 36px;gap:7px;margin-bottom:7px}
   /* ===== 診断ログ（一時デバッグ用） ===== */
-  .diag{position:fixed;left:0;right:0;bottom:0;z-index:200;height:172px;display:flex;flex-direction:column;background:var(--surface);border-top:1px solid var(--border);box-shadow:0 -4px 16px rgba(0,0,0,.18)}
-  .diag-head{display:flex;align-items:center;justify-content:space-between;padding:5px 10px;font-size:11px;font-weight:600;color:var(--text-sub);border-bottom:1px solid var(--border)}
+  /* 診断ログ（Ctrl+Shift+Dで表示切替する右下フローティング） */
+  .diag{position:fixed;right:16px;bottom:16px;z-index:9999;width:400px;max-width:calc(100vw - 32px);height:300px;max-height:calc(100vh - 32px);display:flex;flex-direction:column;background:rgba(18,20,26,.92);color:#e7eaf0;border:1px solid rgba(255,255,255,.16);border-radius:10px;box-shadow:0 10px 34px rgba(0,0,0,.45)}
+  .diag[hidden]{display:none!important} /* hidden を確実に効かせる（既定は非表示） */
+  .diag-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;font-size:11px;font-weight:600;border-bottom:1px solid rgba(255,255,255,.14)}
   .diag-actions{display:flex;gap:6px}
-  .diag-actions button{padding:3px 9px;font-size:11px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);box-shadow:none}
-  .diag-body{margin:0;padding:6px 10px;overflow:auto;flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10px;line-height:1.35;white-space:pre-wrap;word-break:break-all;color:var(--text)}
+  .diag-actions button{padding:3px 9px;font-size:11px;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.22);color:#e7eaf0;box-shadow:none;cursor:pointer}
+  .diag-actions button:hover{background:rgba(255,255,255,.2);filter:none}
+  .diag-body{margin:0;padding:8px 10px;overflow:auto;flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-all}
 
   footer{color:var(--text-sub);font-size:11px;text-align:center;margin:8px 0 4px}
   body[data-eff-layout="wide"] footer{position:fixed;left:0;right:0;bottom:8px;margin:0} /* 下部中央に固定, 右カラムの高さに引きずられない */
@@ -309,10 +312,6 @@
           <input id="muteOnLock" type="checkbox" checked>
           <span>画面ロック中は消音する</span>
         </label>
-        <label class="check">
-          <input id="diagToggle" type="checkbox">
-          <span>診断ログを表示（一時デバッグ用）</span>
-        </label>
       </div>
     </details>
   </div>
@@ -322,10 +321,11 @@
 
 <div id="diagPanel" class="diag" hidden>
   <div class="diag-head">
-    <span>診断ログ</span>
+    <span>診断ログ（Ctrl+Shift+D）</span>
     <span class="diag-actions">
       <button id="diagClear" type="button">クリア</button>
       <button id="diagCopy" type="button">全文コピー</button>
+      <button id="diagClose" type="button">閉じる</button>
     </span>
   </div>
   <pre id="diagLog" class="diag-body"></pre>
@@ -456,21 +456,29 @@ let lastWakeAttempt = 0;                          // wakeLock再取得のスロ�
 let lastTickTs = Date.now();                      // 時間ジャンプ検知用
 
 /* ---------- 診断ログ（一時デバッグ用・消音判定には影響しない） ---------- */
-let diagOn = false;
+// 記録は常時行う（表示ON/OFFに関わらず配列へ蓄積）。表示は Ctrl+Shift+D でトグル。
+const DIAG_MAX = 300;
 const diagLines = [];
+let diagVisible = false;
 function diag(event, detail){
   const line = "[" + Math.round(performance.now()) + "] " + event +
                ((detail !== undefined && detail !== "") ? " | " + detail : "");
   diagLines.push(line);
-  if(diagLines.length > 200) diagLines.shift(); // 最大200行
+  if(diagLines.length > DIAG_MAX) diagLines.shift(); // 最大300行, 古い順に破棄
   try{ console.log(line); }catch(e){}
-  if(diagOn) renderDiag();
+  if(diagVisible) renderDiag();
 }
 function renderDiag(){
   const log = document.getElementById("diagLog");
   if(!log) return;
   log.textContent = diagLines.join("\n");
   log.scrollTop = log.scrollHeight;
+}
+function toggleDiag(force){
+  diagVisible = (force === undefined) ? !diagVisible : !!force;
+  const panel = document.getElementById("diagPanel");
+  if(panel) panel.hidden = !diagVisible;
+  if(diagVisible) renderDiag();
 }
 
 /* ---------- DOM ---------- */
@@ -483,7 +491,7 @@ const el = {
   soundType:$("soundType"), soundDur:$("soundDur"), soundDurVal:$("soundDurVal"),
   volume:$("volume"), volumeVal:$("volumeVal"), btnTestSound:$("btnTestSound"),
   muteOnLock:$("muteOnLock"),
-  diagToggle:$("diagToggle"), diagPanel:$("diagPanel"), diagClear:$("diagClear"), diagCopy:$("diagCopy"),
+  diagPanel:$("diagPanel"), diagClear:$("diagClear"), diagCopy:$("diagCopy"), diagClose:$("diagClose"),
   themeBtn:$("themeBtn"), layoutBtn:$("layoutBtn"),
   schedSelect:$("schedSelect"), schedList:$("schedList"), btnAddSched:$("btnAddSched")
 };
@@ -663,10 +671,11 @@ function playSound(type, durationSec, volumePct){
 }
 function playPhaseSound(){
   const muted = settings.muteOnLock && isScreenLocked; // 画面ロック/スリープ中は消音
-  diag("playPhaseSound", (muted ? "MUTED" : "PLAY") +
-    " | isScreenLocked=" + isScreenLocked +
+  diag("emitSound", (muted ? "MUTED" : "PLAY") +
+    " | muteOnLock=" + settings.muteOnLock +
+    " isScreenLocked=" + isScreenLocked +
     " visibility=" + document.visibilityState +
-    " muteOnLock=" + settings.muteOnLock);
+    " type=" + settings.soundType);
   if(muted) return;
   playSound(settings.soundType, settings.soundDur, settings.volume);
 }
@@ -753,6 +762,7 @@ el.btnStart.addEventListener("click", () => {
   ensureAudio(); // 自動再生制限対策：クリック時に生成/resume
   const now = Date.now();
   const active = getActiveSchedule();
+  diag("timer.start", active ? ("schedule=" + active.name) : "no schedule");
 
   if(active){
     if(schedInvalid(active)){
@@ -783,15 +793,18 @@ el.btnPause.addEventListener("click", () => {
   if(state === "running"){
     pausedRemaining = Math.max(0, phaseEndTime - Date.now());
     state = "paused";
+    diag("timer.pause");
   }else if(state === "paused"){
     phaseEndTime = Date.now() + pausedRemaining;
     state = "running";
+    diag("timer.resume");
   }
   updateButtons(); refreshDisplay();
 });
 
 el.btnSkip.addEventListener("click", () => {
   if(state !== "running" && state !== "paused") return;
+  diag("timer.skip");
   advancePhase(Date.now(), true);
   if(state === "paused") pausedRemaining = phaseDurationMs(phaseIndex);
   refreshDisplay();
@@ -800,6 +813,7 @@ el.btnSkip.addEventListener("click", () => {
 el.btnReset.addEventListener("click", resetToIdle);
 
 function resetToIdle(){
+  diag("timer.reset");
   state = "idle";
   phaseIndex = 0; cycleCount = 0;
   phaseEndTime = 0; pausedRemaining = 0; waitStartTs = 0; scheduleStopTs = 0;
@@ -815,6 +829,7 @@ function advancePhase(now, resetAlignment, silent){
   if(phaseIndex === 0) cycleCount++;
   phaseEndTime = resetAlignment ? (now + phaseDurationMs(phaseIndex))
                                 : (phaseEndTime + phaseDurationMs(phaseIndex));
+  diag("phaseChange", "→ " + settings.phases[phaseIndex].name + (silent ? " (silent)" : ""));
   if(!silent) playPhaseSound();
 }
 
@@ -840,11 +855,12 @@ function tick(){
 
   if(state === "running"){
     if(scheduleStopTs && now >= scheduleStopTs){ resetToIdle(); return; }
-    let guard = 0;
+    let guard = 0, skipped = 0;
     while(now >= phaseEndTime && guard < 10000){
-      advancePhase(now, false, silent); guard++; // スリープ復帰時はフェーズだけ進めて消音
+      advancePhase(now, false, silent); guard++; skipped++; // スリープ復帰時はフェーズだけ進めて消音
       if(scheduleStopTs && now >= scheduleStopTs){ resetToIdle(); return; }
     }
+    if(gap >= 2000 && skipped > 0) diag("catchup", skipped + " phases (silent=" + silent + ")");
   }
   refreshDisplay();
 }
@@ -948,12 +964,14 @@ el.muteOnLock.addEventListener("change", () => {
   }
 });
 
-/* ---------- 診断ログUI（一時デバッグ用） ---------- */
-el.diagToggle.addEventListener("change", () => {
-  diagOn = el.diagToggle.checked;
-  el.diagPanel.hidden = !diagOn;
-  if(diagOn){ diag("diag", "開始 (wakeLockSupported=" + wakeLockSupported + ")"); renderDiag(); }
+/* ---------- 診断ログUI（Ctrl+Shift+Dで表示切替） ---------- */
+document.addEventListener("keydown", (e) => {
+  if((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === "KeyD"){
+    e.preventDefault();
+    toggleDiag();
+  }
 });
+el.diagClose.addEventListener("click", () => toggleDiag(false));
 el.diagClear.addEventListener("click", () => { diagLines.length = 0; renderDiag(); });
 el.diagCopy.addEventListener("click", async () => {
   const text = diagLines.join("\n");
@@ -1093,13 +1111,24 @@ function initFromSettings(){
   el.soundDur.value = settings.soundDur; setSoundDurLabel();
   el.volume.value = settings.volume; setVolumeLabel();
   el.muteOnLock.checked = settings.muteOnLock;
-  diagOn = false; el.diagToggle.checked = false; el.diagPanel.hidden = true; // 診断ログは既定OFF
+  diagVisible = false; el.diagPanel.hidden = true; // 診断パネルは既定で非表示（記録は常時）
   renderSchedList(); renderSchedSelect();
   applyTheme();
   applyLayout();
   updateButtons();
   refreshDisplay();
 }
+
+// 例外を診断ログに記録
+window.addEventListener("error", (e) => {
+  diag("window.onerror", (e.message || "error") + " @ " + (e.filename || "?") + ":" + (e.lineno || "?") + ":" + (e.colno || "?"));
+});
+window.addEventListener("unhandledrejection", (e) => {
+  diag("unhandledrejection", String((e.reason && e.reason.message) || e.reason || "?"));
+});
+
+// 起動ログ（必ず1行目。出ていなければ古いファイル表示と判別できる）
+diag("app.start", "KB専用タイマー v" + APP_VERSION + " | " + new Date().toLocaleString("ja-JP"));
 
 initFromSettings();
 setInterval(tick, 250);
