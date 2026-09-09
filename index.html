@@ -307,7 +307,7 @@
 "use strict";
 
 /* ---------- アプリのバージョン（変更はここだけ） ---------- */
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.2.0";
 
 /* ---------- 設定の保存/復元 ---------- */
 const LS_KEY = "loop-timer-settings-v2";
@@ -418,9 +418,6 @@ let waitStartTs = 0;
 let scheduleStopTs = 0;
 let waitSchedName = "";
 
-/* ---------- 時間ジャンプ検知 ---------- */
-let lastTickTs = Date.now();                      // スリープ/長時間非アクティブ復帰の検知用
-
 /* ---------- DOM ---------- */
 const $ = id => document.getElementById(id);
 const el = {
@@ -520,7 +517,8 @@ el.btnAddPhase.addEventListener("click", () => {
 
 /* ---------- 通知音（Web Audio） ---------- */
 let audioCtx = null;
-// AudioContext は初回のユーザー操作時に生成し、以降は使い回す。suspended なら resume。
+// AudioContext は初回のユーザー操作時に生成し、以降は使い回す。
+// suspended / interrupted(Safari固有) なら resume を試みる。
 function ensureAudio(){
   try{
     if(!audioCtx){
@@ -528,22 +526,38 @@ function ensureAudio(){
       if(!AC) return null;
       audioCtx = new AC();
     }
-    if(audioCtx.state === "suspended") audioCtx.resume();
+    resumeAudioIfNeeded();
     return audioCtx;
   }catch(e){
     console.error("[KB Timer] AudioContext init failed:", e);
     return null;
   }
 }
+// suspended / interrupted なら resume。消音判定には一切使わない（resume のみが目的）。
+function resumeAudioIfNeeded(){
+  if(audioCtx && (audioCtx.state === "suspended" || audioCtx.state === "interrupted")){
+    try{
+      const p = audioCtx.resume();
+      if(p && p.catch) p.catch(e => console.error("[KB Timer] AudioContext resume failed:", e));
+    }catch(e){
+      console.error("[KB Timer] AudioContext resume failed:", e);
+    }
+  }
+}
 
 // 通知音を鳴らす唯一の入口。種類が「なし」のときだけ鳴らさない（それ以外は常に鳴る）。
 // OscillatorNode/GainNode を都度生成し、現在時刻から即座に start（未来時刻へは予約しない）。
 // 指定秒数で必ず停止し、末尾はフェードアウト。音量スライダーの値を GainNode に反映。
-function emitSound(){
+// Safari 対策として、鳴らす直前に毎回 suspended/interrupted を確認し resume を await する。
+async function emitSound(){
   if(settings.soundType === "none") return; // 早期returnは「なし」のときのみ
   try{
     const ctx = ensureAudio();
     if(!ctx) return;
+    if(ctx.state === "suspended" || ctx.state === "interrupted"){
+      try{ await ctx.resume(); }
+      catch(e){ console.error("[KB Timer] AudioContext resume failed:", e); }
+    }
     const now = ctx.currentTime;
     const dur = clamp(Number(settings.soundDur) || 3, 0.5, 10);
     const vol = clamp(Number(settings.volume) / 100, 0, 1);
@@ -614,6 +628,37 @@ function emitSound(){
   }
 }
 
+/* ---------- 無音キープアライブ（Safariのバックグラウンド停止対策） ---------- */
+// タイマー動作中は音量ほぼ0の無音オシレータを鳴らし続け、AudioContextをアクティブに保つ。
+// 通知音とは完全に別ノードで、emitSound() には影響しない。
+let keepAlive = null;
+function startKeepAlive(){
+  const ctx = ensureAudio();
+  if(!ctx || keepAlive) return;
+  try{
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    g.gain.value = 0.0001;                 // 実質無音
+    osc.frequency.value = 440;
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start();
+    keepAlive = { osc, g };
+  }catch(e){
+    console.error("[KB Timer] keepAlive start failed:", e);
+  }
+}
+function stopKeepAlive(){
+  if(!keepAlive) return;
+  try{ keepAlive.osc.stop(); keepAlive.osc.disconnect(); keepAlive.g.disconnect(); }catch(e){}
+  keepAlive = null;
+}
+
+// 可視性復帰・フォーカス時にも resume を試みる（消音判定には使わない）。
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "visible") resumeAudioIfNeeded();
+});
+window.addEventListener("focus", resumeAudioIfNeeded);
+
 /* ---------- 時刻ユーティリティ ---------- */
 function parseTimeToday(hhmm, baseMs){
   const [h, m] = hhmm.split(":").map(Number);
@@ -645,6 +690,7 @@ function phaseDurationMs(i){ return settings.phases[i].seconds * 1000; }
 function beginPhaseLoop(now, playSoundNow){
   state = "running";
   phaseEndTime = now + phaseDurationMs(phaseIndex);
+  startKeepAlive(); // 動作中はAudioContextを維持（Safari対策）
   if(playSoundNow) emitSound();
   updateButtons();
 }
@@ -669,6 +715,7 @@ el.btnStart.addEventListener("click", () => {
       waitStartTs = sc.nextStart;
       scheduleStopTs = sc.nextStop;
       waitSchedName = active.name;
+      startKeepAlive(); // 待機中もAudioContextを維持
       updateButtons();
     }
   }else{
@@ -703,6 +750,7 @@ function resetToIdle(){
   phaseIndex = 0; cycleCount = 0;
   phaseEndTime = 0; pausedRemaining = 0; waitStartTs = 0; scheduleStopTs = 0;
   waitSchedName = "";
+  stopKeepAlive(); // 停止/リセット/スケジュール終了で無音オシレータを破棄
   updateButtons(); refreshDisplay();
 }
 
@@ -718,11 +766,6 @@ function advancePhase(now, resetAlignment, silent){
 /* ---------- 毎フレーム更新 ---------- */
 function tick(){
   const now = Date.now();
-  // 前回tickからの経過が5秒以上ならスリープ/長時間非アクティブからの復帰とみなし、
-  // 追いつき分のフェーズ切替は無音にする（連続鳴動の防止）。リアルタイム到来分のみ鳴らす。
-  const gap = now - lastTickTs;
-  const silent = gap >= 5000;
-  lastTickTs = now;
 
   if(state === "waiting"){
     if(now >= waitStartTs){ phaseIndex = 0; beginPhaseLoop(now, true); }
@@ -730,11 +773,14 @@ function tick(){
 
   if(state === "running"){
     if(scheduleStopTs && now >= scheduleStopTs){ resetToIdle(); return; }
-    let guard = 0;
+    // 絶対時刻ベース。過ぎたフェーズはループ内では無音で一括処理し、
+    // 進んだ場合のみ最後に1回だけ鳴らす（間引き復帰でも連続鳴動しない）。
+    let guard = 0, advanced = 0;
     while(now >= phaseEndTime && guard < 10000){
-      advancePhase(now, false, silent); guard++; // スリープ復帰時はフェーズだけ進めて消音
+      advancePhase(now, false, true); guard++; advanced++;
       if(scheduleStopTs && now >= scheduleStopTs){ resetToIdle(); return; }
     }
+    if(advanced > 0) emitSound(); // まとめ処理でも最新の切替1回だけ鳴らす
   }
   refreshDisplay();
 }
