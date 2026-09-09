@@ -307,7 +307,7 @@
 "use strict";
 
 /* ---------- アプリのバージョン（変更はここだけ） ---------- */
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.1";
 
 /* ---------- 設定の保存/復元 ---------- */
 const LS_KEY = "loop-timer-settings-v2";
@@ -520,97 +520,98 @@ el.btnAddPhase.addEventListener("click", () => {
 
 /* ---------- 通知音（Web Audio） ---------- */
 let audioCtx = null;
+// AudioContext は初回のユーザー操作時に生成し、以降は使い回す。suspended なら resume。
 function ensureAudio(){
-  if(!audioCtx){
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if(!AC) return null;
-    audioCtx = new AC();
+  try{
+    if(!audioCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return null;
+      audioCtx = new AC();
+    }
+    if(audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }catch(e){
+    console.error("[KB Timer] AudioContext init failed:", e);
+    return null;
   }
-  if(audioCtx.state === "suspended") audioCtx.resume();
-  return audioCtx;
 }
 
-// type に応じた音を生成。必ず durationSec で自動停止し、末尾はフェードアウト。
-// 「なし」は無音（AudioContextを鳴らさない）。
-function playSound(type, durationSec, volumePct){
-  if(type === "none") return;
-  const ctx = ensureAudio();
-  if(!ctx) return;
-  const now = ctx.currentTime;
-  const dur = clamp(Number(durationSec) || 3, 0.5, 10);
-  const vol = clamp((Number(volumePct)) / 100, 0, 1);
-  if(vol <= 0) return; // 音量0は無音
+// 通知音を鳴らす唯一の入口。種類が「なし」のときだけ鳴らさない（それ以外は常に鳴る）。
+// OscillatorNode/GainNode を都度生成し、現在時刻から即座に start（未来時刻へは予約しない）。
+// 指定秒数で必ず停止し、末尾はフェードアウト。音量スライダーの値を GainNode に反映。
+function emitSound(){
+  if(settings.soundType === "none") return; // 早期returnは「なし」のときのみ
+  try{
+    const ctx = ensureAudio();
+    if(!ctx) return;
+    const now = ctx.currentTime;
+    const dur = clamp(Number(settings.soundDur) || 3, 0.5, 10);
+    const vol = clamp(Number(settings.volume) / 100, 0, 1);
+    if(vol <= 0) return; // 音量0%は無音
 
-  // マスター：全体を包むエンベロープ（フェードイン＋末尾フェードアウトで確実に無音化）
-  const master = ctx.createGain();
-  master.connect(ctx.destination);
-  const attack = 0.02;
-  const release = Math.min(0.5, dur * 0.35);
-  const holdEnd = Math.max(attack, dur - release);
-  master.gain.setValueAtTime(0.0001, now);
-  master.gain.exponentialRampToValueAtTime(vol, now + attack);
-  master.gain.setValueAtTime(vol, now + holdEnd);
-  master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    // マスター：フェードイン＋指定秒での末尾フェードアウト（プツッ音防止・確実に無音化）
+    const master = ctx.createGain();
+    master.connect(ctx.destination);
+    const release = Math.min(0.5, dur * 0.35);
+    const holdEnd = Math.max(0.02, dur - release);
+    master.gain.setValueAtTime(0.0001, now);
+    master.gain.exponentialRampToValueAtTime(vol, now + 0.02);
+    master.gain.setValueAtTime(vol, now + holdEnd);
+    master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
 
-  if(type === "beep"){
-    // 現行の和音ビープ
-    [["triangle",660,0.5],["sine",880,0.22],["sine",1320,0.22]].forEach(([w,f,g])=>{
-      const osc = ctx.createOscillator(); const gain = ctx.createGain();
-      osc.type = w; osc.frequency.setValueAtTime(f, now);
-      gain.gain.setValueAtTime(g, now);
-      osc.connect(gain); gain.connect(master);
-      osc.start(now); osc.stop(now + dur + 0.05);
-    });
+    const type = settings.soundType;
+    const stopAt = now + dur + 0.05;
 
-  }else if(type === "chime"){
-    // 下降アルペジオ 880 → 659 → 523
-    const notes = [880, 659, 523];
-    const step = dur / notes.length;
-    notes.forEach((f, i) => {
-      const t0 = i * step;
+    // 1ボイス生成。oscは即時 start（osc.start()）。発音区間は GainNode の窓で作る。
+    const voice = (wave, freq, peak, onAt, offAt) => {
       const osc = ctx.createOscillator();
       const g = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.setValueAtTime(f, now + t0);
-      g.gain.setValueAtTime(0.0001, now + t0);
-      g.gain.exponentialRampToValueAtTime(0.6, now + t0 + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + t0 + step * 0.95);
+      osc.type = wave;
+      osc.frequency.setValueAtTime(freq, now);
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.setValueAtTime(0.0001, onAt);                    // 発音開始まで無音を保持
+      g.gain.exponentialRampToValueAtTime(peak, onAt + 0.02); // 素早い立ち上がり
+      g.gain.exponentialRampToValueAtTime(0.0001, offAt);     // 減衰
       osc.connect(g); g.connect(master);
-      osc.start(now + t0); osc.stop(now + t0 + step + 0.05);
-    });
+      osc.start();          // 現在時刻から即座に開始（未来予約なし）
+      osc.stop(stopAt);
+    };
 
-  }else if(type === "bell"){
-    // 高めの正弦波 1200Hz を長めの指数減衰で
-    const g1 = ctx.createGain(); const o1 = ctx.createOscillator();
-    o1.type = "sine"; o1.frequency.setValueAtTime(1200, now);
-    g1.gain.setValueAtTime(0.0001, now);
-    g1.gain.exponentialRampToValueAtTime(0.8, now + 0.008);
-    g1.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    o1.connect(g1); g1.connect(master); o1.start(now); o1.stop(now + dur + 0.05);
-    // 倍音を少し
-    const g2 = ctx.createGain(); const o2 = ctx.createOscillator();
-    o2.type = "sine"; o2.frequency.setValueAtTime(2400, now);
-    g2.gain.setValueAtTime(0.0001, now);
-    g2.gain.exponentialRampToValueAtTime(0.22, now + 0.008);
-    g2.gain.exponentialRampToValueAtTime(0.0001, now + dur * 0.55);
-    o2.connect(g2); g2.connect(master); o2.start(now); o2.stop(now + dur + 0.05);
+    if(type === "beep"){
+      // 和音ビープ
+      voice("triangle", 660, 0.5, now, now + dur);
+      voice("sine", 880, 0.22, now, now + dur);
+      voice("sine", 1320, 0.22, now, now + dur);
 
-  }else if(type === "soft"){
-    // 三角波の柔らかい単音 600Hz、アタックを緩やかに
-    const g = ctx.createGain(); const o = ctx.createOscillator();
-    o.type = "triangle"; o.frequency.setValueAtTime(600, now);
-    const a = Math.min(0.35, dur * 0.3);
-    g.gain.setValueAtTime(0.0001, now);
-    g.gain.exponentialRampToValueAtTime(0.75, now + a);
-    g.gain.setValueAtTime(0.75, now + Math.max(a, dur - release));
-    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    o.connect(g); g.connect(master); o.start(now); o.stop(now + dur + 0.05);
+    }else if(type === "chime"){
+      // 下降アルペジオ 880 → 659 → 523（gain窓で順に鳴らす）
+      const notes = [880, 659, 523];
+      const step = dur / notes.length;
+      notes.forEach((f, i) => voice("sine", f, 0.6, now + i * step, now + (i + 1) * step * 0.95));
+
+    }else if(type === "bell"){
+      // 高めの正弦波を長い減衰で（倍音を少し重ねる）
+      voice("sine", 1200, 0.8, now, now + dur);
+      voice("sine", 2400, 0.22, now, now + dur * 0.55);
+
+    }else if(type === "soft"){
+      // 三角波の柔らかい単音、アタックを緩やかに
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(600, now);
+      const a = Math.min(0.35, dur * 0.3);
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.75, now + a);
+      g.gain.setValueAtTime(0.75, now + Math.max(a, dur - release));
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      osc.connect(g); g.connect(master);
+      osc.start();
+      osc.stop(stopAt);
+    }
+  }catch(e){
+    console.error("[KB Timer] emitSound failed:", e);
   }
-}
-// 通知音を鳴らす唯一の入口。種類が「なし」のときだけ鳴らさない（それ以外は常に鳴る）。
-function emitSound(){
-  if(settings.soundType === "none") return;
-  playSound(settings.soundType, settings.soundDur, settings.volume);
 }
 
 /* ---------- 時刻ユーティリティ ---------- */
